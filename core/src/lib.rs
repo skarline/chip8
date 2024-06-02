@@ -1,15 +1,9 @@
-use std::{
-    env, fs, process,
-    time::{Duration, Instant},
-};
-
 use instruction::Instruction;
-use sdl2::{event::Event, keyboard::Keycode, pixels::Color, rect::Rect};
 
 mod instruction;
 
-const DISPLAY_WIDTH: usize = 64;
-const DISPLAY_HEIGHT: usize = 32;
+pub const DISPLAY_WIDTH: usize = 64;
+pub const DISPLAY_HEIGHT: usize = 32;
 
 const MEMORY_SIZE: usize = 4096;
 
@@ -34,7 +28,12 @@ const FONT_SPRITES: [u8; 80] = [
     0xF0, 0x80, 0xF0, 0x80, 0x80, // F
 ];
 
-struct Emulator {
+enum EmulatorState {
+    Running,
+    WaitingKeyPress { x: usize },
+}
+
+pub struct Emulator {
     v: [u8; 16],
     i: u16,
     pc: u16,
@@ -43,9 +42,9 @@ struct Emulator {
     delay_timer: u8,
     sound_timer: u8,
     memory: [u8; MEMORY_SIZE],
+    state: EmulatorState,
     buffer: [bool; DISPLAY_WIDTH * DISPLAY_HEIGHT],
     keys: [bool; 16],
-    waiting_key_vx: Option<usize>,
 }
 
 impl Emulator {
@@ -59,9 +58,9 @@ impl Emulator {
             delay_timer: 0,
             sound_timer: 0,
             memory: [0; MEMORY_SIZE],
+            state: EmulatorState::Running,
             buffer: [false; DISPLAY_WIDTH * DISPLAY_HEIGHT],
             keys: [false; 16],
-            waiting_key_vx: None,
         }
     }
 
@@ -71,7 +70,7 @@ impl Emulator {
         high_byte << 8 | low_byte
     }
 
-    pub fn decode(&mut self, opcode: u16) -> Instruction {
+    fn decode(&mut self, opcode: u16) -> Instruction {
         let address = opcode & 0x0FFF;
         let byte = (opcode & 0x00FF) as u8;
         let x = ((opcode & 0x0F00) >> 8) as usize;
@@ -130,8 +129,6 @@ impl Emulator {
     }
 
     pub fn execute(&mut self, instruction: Instruction) {
-        println!("{}", instruction.to_str());
-
         match instruction {
             Instruction::System { address: _ } => {}
             Instruction::Clear => {
@@ -258,9 +255,7 @@ impl Emulator {
             Instruction::LoadDelay { x } => {
                 self.v[x] = self.delay_timer;
             }
-            Instruction::WaitKeyPress { x } => {
-                self.waiting_key_vx = Some(x);
-            }
+            Instruction::WaitKeyPress { x } => self.state = EmulatorState::WaitingKeyPress { x },
             Instruction::SetDelay { x } => {
                 self.delay_timer = self.v[x];
             }
@@ -293,18 +288,24 @@ impl Emulator {
     }
 
     pub fn cycle(&mut self) {
-        if let Some(x) = self.waiting_key_vx {
-            for key in self.keys {
-                if key {
-                    self.v[x] = key as u8;
-                    self.waiting_key_vx = None;
+        match self.state {
+            EmulatorState::Running => {
+                let opcode = self.fetch();
+                let instruction = self.decode(opcode);
+
+                println!("{:03X}: {}", self.pc, instruction.to_str());
+
+                self.pc += 2;
+                self.execute(instruction);
+            }
+            EmulatorState::WaitingKeyPress { x } => {
+                for key in self.keys {
+                    if key {
+                        self.v[x] = key as u8;
+                        self.state = EmulatorState::Running;
+                    }
                 }
             }
-        } else {
-            let opcode = self.fetch();
-            let instruction = self.decode(opcode);
-            self.pc += 2;
-            self.execute(instruction);
         }
     }
 
@@ -317,122 +318,16 @@ impl Emulator {
         self.memory[0..FONT_SPRITES.len()].copy_from_slice(&FONT_SPRITES);
         self.memory[0x200..0x200 + program.len()].copy_from_slice(program);
     }
-}
 
-fn keycode_to_key(keycode: Keycode) -> Option<u8> {
-    match keycode {
-        Keycode::Num1 => Some(0x1),
-        Keycode::Num2 => Some(0x2),
-        Keycode::Num3 => Some(0x3),
-        Keycode::Num4 => Some(0xC),
-        Keycode::Q => Some(0x4),
-        Keycode::W => Some(0x5),
-        Keycode::E => Some(0x6),
-        Keycode::R => Some(0xD),
-        Keycode::A => Some(0x7),
-        Keycode::S => Some(0x8),
-        Keycode::D => Some(0x9),
-        Keycode::F => Some(0xE),
-        Keycode::Z => Some(0xA),
-        Keycode::X => Some(0x0),
-        Keycode::C => Some(0xB),
-        Keycode::V => Some(0xF),
-        _ => None,
-    }
-}
-
-fn main() {
-    let args: Vec<String> = env::args().collect();
-
-    if args.len() < 2 {
-        eprintln!("Usage: chip8 <Program file>");
-        process::exit(1);
+    pub fn key_down(&mut self, key: u8) {
+        self.keys[key as usize] = true;
     }
 
-    let program_path = &args[1];
-    let program = fs::read(program_path).expect("Failed to read program");
+    pub fn key_up(&mut self, key: u8) {
+        self.keys[key as usize] = false;
+    }
 
-    let mut emulator = Emulator::new();
-    emulator.load(&program);
-
-    let sdl_context = sdl2::init().unwrap();
-    let video_subsystem = sdl_context.video().unwrap();
-    let window = video_subsystem
-        .window(
-            "CHIP-8",
-            DISPLAY_WIDTH as u32 * 10,
-            DISPLAY_HEIGHT as u32 * 10,
-        )
-        .build()
-        .unwrap();
-
-    let mut canvas = window.into_canvas().accelerated().build().unwrap();
-
-    let mut event_pump = sdl_context.event_pump().unwrap();
-
-    let frame_interval = Duration::from_millis(1000 / 60);
-    let timer_interval = Duration::from_millis(1000 / 60);
-    let cpu_interval = Duration::from_millis(1000 / 500);
-
-    let mut last_frame_update = Instant::now();
-    let mut last_timer_update = Instant::now();
-    let mut last_cpu_update = Instant::now();
-
-    'running: loop {
-        for event in event_pump.poll_iter() {
-            match event {
-                Event::Quit { .. } => break 'running,
-                Event::KeyDown {
-                    keycode: Some(keycode),
-                    ..
-                } => {
-                    if let Some(key) = keycode_to_key(keycode) {
-                        emulator.keys[key as usize] = true;
-                    }
-                }
-                Event::KeyUp {
-                    keycode: Some(keycode),
-                    ..
-                } => {
-                    if let Some(key) = keycode_to_key(keycode) {
-                        emulator.keys[key as usize] = false;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let now = Instant::now();
-
-        if now.duration_since(last_frame_update) >= frame_interval {
-            canvas.set_draw_color(Color::BLACK);
-            canvas.clear();
-
-            canvas.set_draw_color(Color::WHITE);
-
-            for (i, &pixel) in emulator.buffer.iter().enumerate() {
-                if pixel {
-                    let x = i % DISPLAY_WIDTH;
-                    let y = i / DISPLAY_WIDTH;
-
-                    canvas
-                        .fill_rect(Rect::new(x as i32 * 10, y as i32 * 10, 10, 10))
-                        .unwrap();
-                }
-            }
-
-            canvas.present();
-            last_frame_update = now;
-        }
-
-        if now.duration_since(last_timer_update) >= timer_interval {
-            emulator.timers_cycle();
-            last_timer_update = now;
-        }
-
-        if now.duration_since(last_cpu_update) >= cpu_interval {
-            emulator.cycle();
-            last_cpu_update = now;
-        }
+    pub fn get_buffer(&self) -> &[bool] {
+        &self.buffer
     }
 }
